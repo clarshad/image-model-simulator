@@ -1,2 +1,3 @@
-simulator
+
 *.exe
+deploy/k8s/generated/

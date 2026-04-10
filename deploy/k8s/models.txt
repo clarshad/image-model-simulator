@@ -1,0 +1,28 @@
+# Model catalog for the simulator generator.
+#
+# One model per line. Fields are whitespace-separated:
+#
+#   <model-name>  [replicas]  [min_latency_ms]  [max_latency_ms]  [startup_delay_s]
+#
+# Only the model name is required. Defaults: replicas=3, min=4000, max=8000, startup=10.
+#
+# Lines starting with '#' and blank lines are ignored.
+#
+# After editing this file, regenerate the manifests:
+#
+#   ./scripts/generate-manifests.sh
+#   kubectl apply -f deploy/k8s/generated/all-models.yaml
+#
+# Each row produces one Deployment named "sim-<slug>" in the foundry namespace,
+# carrying the foundry.workload=vllm label so the orchestrator discovers it.
+
+Qwen-Image-Edit-2511-Multiple-Images   5  4000  8000  10
+Qwen-Image-Gen-2511                    3  3000  6000  10
+Qwen-Image-Edit-2511-Single-Image      4  4000  7000  10
+Flux-Dev                               3  5000  9000  15
+Flux-Schnell                           5  1500  3000  10
+SDXL-Base-1.0                          4  3500  6500  12
+SDXL-Turbo                             6  1000  2500  10
+Stable-Diffusion-3-Medium              3  4000  7500  15
+Playground-v2.5                        2  3000  5500  10
+Kandinsky-3                            2  4500  8000  12

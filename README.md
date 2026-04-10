@@ -59,28 +59,65 @@ Then point the orchestrator at them using static discovery:
 
 ## Deploy to Kubernetes
 
-The simulator pods carry the `foundry.workload: vllm` label in the `foundry` namespace — exactly what the orchestrator's k8s discovery expects.
+Each pod serves exactly **one** model. To stand up many models at once, declare them in [deploy/k8s/models.txt](deploy/k8s/models.txt) and run the generator — it produces one Deployment per model in [deploy/k8s/generated/all-models.yaml](deploy/k8s/generated/). All pods carry the `foundry.workload: vllm` label so the orchestrator's k8s discovery picks them up automatically and learns each pod's model name from `/v1/models`.
 
-```bash
-# Build and load image into cluster (k3s example)
-docker build -t image-model-simulator:latest .
-# For k3s — import directly:
-docker save image-model-simulator:latest | ssh <worker-node> sudo k3s ctr images import -
+### 1. Edit the model catalog
 
-# Deploy 3 replicas of one model
-kubectl apply -f deploy/k8s/simulator-deployment.yaml
+`deploy/k8s/models.txt` is whitespace-delimited:
 
-# Scale up/down
-kubectl scale deployment/image-model-simulator --replicas=5 -n foundry
-
-# Deploy multiple models (3x image-edit + 2x image-gen)
-kubectl apply -f deploy/k8s/multi-model.yaml
-
-# Check pods are discovered by orchestrator
-kubectl logs -n turiyam -l app=turiyam-orchestrator --tail=20 | grep -i "register\|discover\|sync"
+```
+# <model-name>  [replicas]  [min_latency_ms]  [max_latency_ms]  [startup_delay_s]
+Qwen-Image-Edit-2511-Multiple-Images   5  4000  8000  10
+Qwen-Image-Gen-2511                    3  3000  6000  10
+Flux-Schnell                           5  1500  3000  10
+SDXL-Turbo                             6  1000  2500  10
 ```
 
-> **Note:** Before deploying simulators, scale down or delete the real model pod to avoid conflicts, or use a different model name for the simulators.
+Only the model name is required. Defaults: `replicas=3`, `min=4000`, `max=8000`, `startup=10`. Comment lines (`#`) and blank lines are ignored.
+
+### 2. Build and load the image
+
+```bash
+docker build -t image-model-simulator:latest .
+
+# k3s example — import directly:
+docker save image-model-simulator:latest | ssh <worker-node> sudo k3s ctr images import -
+```
+
+### 3. Generate and apply manifests
+
+```bash
+./scripts/generate-manifests.sh
+kubectl apply -f deploy/k8s/generated/all-models.yaml
+
+# Verify
+kubectl get deploy -n foundry -l foundry.simulator=true
+kubectl get pods  -n foundry -l foundry.simulator=true
+```
+
+The generator names each Deployment `sim-<slugified-model-name>` and tags it with `foundry.simulator=true` and `foundry.model=<original-name>` so you can target a single model later:
+
+```bash
+# Scale a single model
+kubectl scale deploy/sim-flux-schnell --replicas=10 -n foundry
+
+# Tear down everything
+kubectl delete -f deploy/k8s/generated/all-models.yaml
+```
+
+### Generator overrides
+
+Environment variables let you override generator defaults without editing the script:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MODELS_FILE` | `deploy/k8s/models.txt` | Source catalog |
+| `OUTPUT_DIR` | `deploy/k8s/generated` | Where manifests are written |
+| `NAMESPACE` | `foundry` | Target namespace |
+| `IMAGE` | `image-model-simulator:latest` | Container image |
+| `IMAGE_PULL_POLICY` | `IfNotPresent` | Pull policy |
+
+> **Note:** Before deploying simulators, scale down or delete any real model pods that share names, or use distinct names for the simulators to avoid conflicts.
 
 ## Configuration
 
@@ -300,12 +337,14 @@ The `scripts/inject-failure.sh` script automates failure injection across k8s po
 
 ```
 image-model-simulator/
-├── cmd/simulator/main.go       # Application entry point
+├── cmd/simulator/main.go              # Application entry point (single-model server)
 ├── deploy/k8s/
-│   ├── simulator-deployment.yaml   # Single-model deployment (3 replicas)
-│   └── multi-model.yaml            # Multi-model deployment
+│   ├── models.txt                     # Model catalog — edit this to declare models
+│   └── generated/                     # Generated manifests (gitignored)
+│       └── all-models.yaml
 ├── scripts/
-│   └── inject-failure.sh       # K8s failure injection helper
+│   ├── generate-manifests.sh          # Reads models.txt, emits one Deployment per model
+│   └── inject-failure.sh              # K8s failure injection helper
 ├── Dockerfile
 ├── go.mod
 └── README.md

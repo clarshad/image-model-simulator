@@ -36,8 +36,9 @@ get_pods() {
     if [[ -n "$target_pod" ]]; then
         echo "$target_pod"
     else
-        kubectl get pods -n "$NAMESPACE" -l foundry.workload=vllm,app=image-model-simulator -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || \
-        kubectl get pods -n "$NAMESPACE" -l app=image-model-simulator -o jsonpath='{.items[*].metadata.name}'
+        # Selects all simulator pods regardless of which model they serve.
+        # The foundry.simulator=true label is set by scripts/generate-manifests.sh.
+        kubectl get pods -n "$NAMESPACE" -l foundry.simulator=true -o jsonpath='{.items[*].metadata.name}'
     fi
 }
 
