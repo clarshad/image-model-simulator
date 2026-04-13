@@ -19,8 +19,8 @@ MODELS_FILE="${MODELS_FILE:-$REPO_ROOT/deploy/k8s/models.txt}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/deploy/k8s/generated}"
 OUTPUT_FILE="$OUTPUT_DIR/all-models.yaml"
 
-NAMESPACE="${NAMESPACE:-foundry}"
-IMAGE="${IMAGE:-image-model-simulator:latest}"
+NAMESPACE="${NAMESPACE:-foundry-simulator}"
+IMAGE="${IMAGE:-ini8labs/image-model-simulator:latest}"
 IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-IfNotPresent}"
 
 # Defaults applied when a row omits a field.
@@ -116,6 +116,10 @@ spec:
         foundry.simulator: "true"
         foundry.model: "$model_name"
     spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: simulator
           image: $IMAGE
