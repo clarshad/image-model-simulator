@@ -88,13 +88,15 @@ type Metrics struct {
 
 func main() {
 	var (
-		port        int
-		adminPort   int
-		modelName   string
-		minLatency  int
-		maxLatency  int
-		startupDelay int
-		logLevel    string
+		port              int
+		adminPort         int
+		modelName         string
+		minLatency        int
+		maxLatency        int
+		startupDelay      int
+		logLevel          string
+		responseSizeKB    int
+		responseJitterKB  int
 	)
 
 	flag.IntVar(&port, "port", envInt("PORT", 8000), "main server port")
@@ -103,6 +105,8 @@ func main() {
 	flag.IntVar(&minLatency, "min-latency-ms", envInt("MIN_LATENCY_MS", 4000), "minimum inference latency (ms)")
 	flag.IntVar(&maxLatency, "max-latency-ms", envInt("MAX_LATENCY_MS", 8000), "maximum inference latency (ms)")
 	flag.IntVar(&startupDelay, "startup-delay-s", envInt("STARTUP_DELAY_S", 0), "seconds to wait before becoming healthy (simulates model loading)")
+	flag.IntVar(&responseSizeKB, "response-size-kb", envInt("RESPONSE_SIZE_KB", 0), "size of the base64 image payload in each response (KB). 0 = tiny 64x64 PNG (default)")
+	flag.IntVar(&responseJitterKB, "response-size-jitter-kb", envInt("RESPONSE_JITTER_KB", 0), "per-request size jitter (KB). actual size = response-size-kb + rand(0, response-size-jitter-kb)")
 	flag.StringVar(&logLevel, "log-level", envStr("LOG_LEVEL", "info"), "log level: debug, info, warn, error")
 	flag.Parse()
 
@@ -138,8 +142,28 @@ func main() {
 		close(ready)
 	}
 
-	// Generate a fake inference response image (small 64x64 PNG).
-	fakeImageB64 := generateFakeImageB64()
+	// Pre-generate the base64 image payload once at startup.
+	//
+	// Defaults to a tiny 64x64 PNG (~300 bytes base64) — fast for functional tests.
+	// With --response-size-kb set, we generate a pool of valid-base64 characters of
+	// (size + jitter) KB up front and slice it per request. This lets us reproduce
+	// the realistic response-body I/O load a real vLLM pod imposes on the
+	// orchestrator's proxy (production generates ~4.4 MB base64 per image).
+	var fakeImageB64 string
+	var fakeImageBaseBytes int
+	var fakeImageJitterBytes int
+	if responseSizeKB <= 0 {
+		fakeImageB64 = generateFakeImageB64()
+	} else {
+		fakeImageBaseBytes = responseSizeKB * 1024
+		fakeImageJitterBytes = responseJitterKB * 1024
+		fakeImageB64 = generateFakeBase64Blob(fakeImageBaseBytes + fakeImageJitterBytes)
+		slog.Info("generated large response payload",
+			"base_kb", responseSizeKB,
+			"jitter_kb", responseJitterKB,
+			"total_bytes", len(fakeImageB64),
+		)
+	}
 
 	// --- Main server (model API, port 8000) ---
 	mux := http.NewServeMux()
@@ -289,11 +313,27 @@ func main() {
 		// Return OpenAI-compatible response.
 		metrics.SuccessRequests.Add(1)
 
+		// Select the per-request response payload. When size is not configured,
+		// always return the tiny 64x64 PNG. Otherwise slice the pre-generated
+		// pool to base + rand(0, jitter) bytes so each request varies a bit
+		// (matches the natural size variance real image generators produce).
+		b64 := fakeImageB64
+		if fakeImageBaseBytes > 0 {
+			size := fakeImageBaseBytes
+			if fakeImageJitterBytes > 0 {
+				size += rand.Intn(fakeImageJitterBytes + 1)
+			}
+			if size > len(fakeImageB64) {
+				size = len(fakeImageB64)
+			}
+			b64 = fakeImageB64[:size]
+		}
+
 		resp := map[string]interface{}{
 			"created": time.Now().Unix(),
 			"data": []map[string]interface{}{
 				{
-					"b64_json":       fakeImageB64,
+					"b64_json":       b64,
 					"revised_prompt": prompt,
 				},
 			},
@@ -477,6 +517,19 @@ func generateFakeImageB64() string {
 	png.Encode(encoder, img)
 	encoder.Close()
 	return buf.String()
+}
+
+// generateFakeBase64Blob returns a string of exactly n valid base64 characters.
+// We write base64 characters directly (skipping the actual encode step) because
+// this is consumed by the orchestrator's proxy purely for I/O load — there's
+// no client that needs to decode it back into a real image.
+func generateFakeBase64Blob(n int) string {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	buf := make([]byte, n)
+	for i := range buf {
+		buf[i] = alphabet[rand.Intn(len(alphabet))]
+	}
+	return string(buf)
 }
 
 func envStr(key, fallback string) string {
