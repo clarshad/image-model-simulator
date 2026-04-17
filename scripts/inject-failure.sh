@@ -37,6 +37,7 @@
 #   ./inject-failure.sh scenario multi-pod-failover --model Qwen-Image-Gen-2511
 #   ./inject-failure.sh scenario overload --model Kandinsky-3
 #   ./inject-failure.sh scenario rolling-recovery --model Flux-Dev
+#   ./inject-failure.sh scenario fcfs-queue --model Flux-Dev
 #
 # ────────────────────────────────────────────────────────────────────────
 # PRESETS: healthy, flaky, degraded, down, intermittent-drops, overloaded, circuit-breaker-trip
@@ -98,8 +99,10 @@ admin_post() {
 
 admin_put() {
     local pod="$1" path="$2" body="$3"
+    # BusyBox wget in Alpine only supports --post-data, not arbitrary methods.
+    # The simulator accepts POST on /admin/config as an alias for PUT.
     kubectl exec -n "$NAMESPACE" "$pod" -- \
-        wget -qO- --method=PUT --body-data="$body" "http://localhost:$ADMIN_PORT$path" 2>/dev/null
+        wget -qO- --post-data="$body" "http://localhost:$ADMIN_PORT$path" 2>/dev/null
 }
 
 # ── Apply to pods (parallel where possible) ───────────────────────────
@@ -481,6 +484,83 @@ MSG
     echo "    kubectl logs -n turiyam -l app=turiyam-orchestrator --tail=50 | grep -i 'probe\|recover\|half.open\|register'"
 }
 
+scenario_fcfs_queue() {
+    local model="${TARGET_MODEL:?scenario requires --model}"
+    local pods
+    pods=$(get_pods)
+    local pod_count
+    pod_count=$(echo "$pods" | wc -w | tr -d ' ')
+    local burst_count=$((pod_count * 3))
+    local slow_ms=15000
+
+    cat <<MSG
+
+${CYAN}━━━ SCENARIO: Global FCFS Wait Queue ━━━${NC}
+${YELLOW}Model:${NC}  $model ($pod_count pods)
+
+${YELLOW}What this tests:${NC}
+  The orchestrator's FCFS global wait queue. When all $pod_count workers are busy,
+  additional requests should ZADD to wait_queue:{model} with arrival timestamp
+  and park on a Go channel. As workers release (on ANY orchestrator instance via
+  Redis Pub/Sub), the oldest waiter globally is woken up in strict arrival order.
+
+${YELLOW}Expected behavior:${NC}
+  - First $pod_count requests: acquired immediately (fast path, ~${slow_ms}ms inference)
+  - Next batch: queued in Redis ZSET, served FCFS as workers release
+  - Excess beyond queue-wait-timeout (60s): return 503 after timeout
+
+${YELLOW}Fast path sanity (should NOT touch queue):${NC}
+  When workers are free, acquireScript SPOPs directly. ZADD / Pub/Sub stay idle.
+
+${YELLOW}Steps:${NC}
+  1. Set all $model pods to high latency (${slow_ms}ms per request)
+  2. Run scripts/fcfs-burst.sh to fire $burst_count concurrent requests
+  3. Verify: all complete with 200 (or queue-timeout 503 if over capacity×timeout)
+  4. Orchestrator logs show "acquired from queue" / "queue wait" entries
+
+MSG
+
+    echo -e "${GREEN}[step 1]${NC} Pinning all $model pods to ${slow_ms}ms latency (forces queue pressure)..."
+    # Uses the `slow` preset with ?ms=N query param — deterministic latency,
+    # no error/drop injection (so saturation is pure queue pressure).
+    local pods
+    pods=$(get_pods)
+    for pod in $pods; do
+        local result
+        result=$(admin_post "$pod" "/admin/presets/slow?ms=${slow_ms}" 2>&1) && \
+            echo -e "  ${GREEN}✓${NC} $pod" || \
+            echo -e "  ${RED}✗${NC} $pod: $result"
+    done
+
+    cat <<MSG
+
+${GREEN}[step 2]${NC} Run the burst from a second terminal:
+
+  ./scripts/fcfs-burst.sh $model $burst_count
+
+  That script fires $burst_count concurrent requests and prints:
+    - per-request status + latency
+    - summary: count of 200/503, p50/p95 wait times, arrival-vs-completion order
+    - an "in-order" score — high if the queue is FCFS across orchestrator instances
+
+${GREEN}[step 3]${NC} Watch the orchestrator handle the queue:
+
+  kubectl logs -n turiyam -l app.kubernetes.io/name=turiyam-orchestrator \\
+    --tail=200 -f | grep -i "queue\|waiter\|acquired\|pubsub\|wait_queue"
+
+${GREEN}[step 4]${NC} When done:
+  ./scripts/inject-failure.sh reset --model $model
+
+${YELLOW}What to verify manually:${NC}
+  - Both orchestrator replicas receive queued requests (K8s service LBs them).
+  - A waiter parked on replica A is woken when ANY replica releases a worker
+    (Pub/Sub to notify:{orchestrator-id}). No starvation on one replica.
+  - Completion order roughly matches arrival order — strict FCFS across the fleet.
+  - No requests hang past queue-timeout without a 503 or 200 resolution.
+
+MSG
+}
+
 # ── Main dispatch ─────────────────────────────────────────────────────
 parse_args "$@"
 COMMAND="${POSITIONAL[0]:-help}"
@@ -512,6 +592,7 @@ case "$COMMAND" in
             multi-pod-failover)  scenario_multi_pod_failover ;;
             overload)            scenario_overload ;;
             rolling-recovery)    scenario_rolling_recovery ;;
+            fcfs-queue)          scenario_fcfs_queue ;;
             *)
                 echo -e "${RED}unknown scenario: $SCENARIO${NC}" >&2
                 echo "Available scenarios:"
@@ -521,6 +602,7 @@ case "$COMMAND" in
                 echo "  multi-pod-failover    — one pod down, others route around it (needs --model)"
                 echo "  overload              — slow + errors combined pressure (needs --model)"
                 echo "  rolling-recovery      — full outage then pod-by-pod recovery (needs --model)"
+                echo "  fcfs-queue            — saturate workers and verify FCFS global wait queue (needs --model)"
                 exit 1
                 ;;
         esac
@@ -545,6 +627,7 @@ Presets:
   intermittent-drops    20% connection drops
   overloaded            80% slow + 10% 503s
   circuit-breaker-trip  100% 500 errors
+  slow                  100% slow, deterministic (no errors) — use for FCFS queue tests
 
 Scenarios:
   circuit-breaker-trip  Trip the circuit breaker, then recover
@@ -553,6 +636,7 @@ Scenarios:
   multi-pod-failover    Take one pod down, verify traffic routes around it
   overload              Combined slow + errors pressure test
   rolling-recovery      Full outage, then pod-by-pod recovery
+  fcfs-queue            Saturate workers and verify FCFS global wait queue
 
 Targeting:
   --model <name>        Target only pods serving this model (e.g., --model Flux-Dev)

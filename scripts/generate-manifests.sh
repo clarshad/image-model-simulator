@@ -21,7 +21,7 @@ OUTPUT_FILE="$OUTPUT_DIR/all-models.yaml"
 
 NAMESPACE="${NAMESPACE:-foundry-simulator}"
 IMAGE="${IMAGE:-ini8labs/image-model-simulator:latest}"
-IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-IfNotPresent}"
+IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-Always}"
 
 # Defaults applied when a row omits a field.
 DEFAULT_REPLICAS=3

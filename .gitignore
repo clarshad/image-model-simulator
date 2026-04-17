@@ -1,3 +1,4 @@
 
 *.exe
+/simulator
 deploy/k8s/generated/

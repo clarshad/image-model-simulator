@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -320,7 +321,9 @@ func main() {
 		json.NewEncoder(w).Encode(failures.Get())
 	})
 
-	adminMux.HandleFunc("PUT /admin/config", func(w http.ResponseWriter, r *http.Request) {
+	// Both PUT and POST accept a JSON body. POST is registered because BusyBox
+	// wget (used via kubectl exec) supports --post-data but not arbitrary methods.
+	setConfig := func(w http.ResponseWriter, r *http.Request) {
 		var patch FailureConfig
 		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
@@ -336,7 +339,9 @@ func main() {
 		)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(failures.Get())
-	})
+	}
+	adminMux.HandleFunc("PUT /admin/config", setConfig)
+	adminMux.HandleFunc("POST /admin/config", setConfig)
 
 	adminMux.HandleFunc("POST /admin/reset", func(w http.ResponseWriter, r *http.Request) {
 		failures.Update(FailureConfig{ErrorCode: 500})
@@ -388,8 +393,19 @@ func main() {
 			// High error rate to trip the circuit breaker (needs 5 consecutive failures).
 			cfg.ErrorRate = 1.0
 			cfg.ErrorCode = 500
+		case "slow":
+			// Deterministic 100% slow. Useful for FCFS queue tests — holds workers
+			// busy for a known duration without injecting errors. Duration via ?ms=N.
+			cfg.SlowRate = 1.0
+			extraMs := 15000
+			if v := r.URL.Query().Get("ms"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					extraMs = n
+				}
+			}
+			cfg.SlowExtraMs = extraMs
 		default:
-			http.Error(w, fmt.Sprintf(`{"error":"unknown preset: %s","available":["healthy","flaky","degraded","down","intermittent-drops","overloaded","circuit-breaker-trip"]}`, preset), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf(`{"error":"unknown preset: %s","available":["healthy","flaky","degraded","down","intermittent-drops","overloaded","circuit-breaker-trip","slow"]}`, preset), http.StatusBadRequest)
 			return
 		}
 
